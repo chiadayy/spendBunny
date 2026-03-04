@@ -1,14 +1,25 @@
 from datetime import datetime
+
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from db import connect
 
 
+def _update_user_field(telegram_id: str, field: str, value) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute(
+        f"UPDATE users SET {field} = ? WHERE telegram_id = ?",
+        (value, telegram_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_user_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict:
     """
-    Ensures the user exists in SQLite, returns user settings as a dict.
-    (Transactions remain in-memory for now.)
+    Ensures the user exists in SQLite, then returns user settings as a dict.
     """
     telegram_id = str(update.effective_user.id)
     chat_id = str(update.effective_chat.id)
@@ -16,28 +27,28 @@ def get_user_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict:
     conn = connect()
     cur = conn.cursor()
 
-    # create user if not exists
     cur.execute(
         """
-        INSERT OR IGNORE INTO users (telegram_id, chat_id, timezone, daily_enabled, daily_time, last_sent_date, created_at)
+        INSERT INTO users (telegram_id, chat_id, timezone, daily_enabled, daily_time, last_sent_date, created_at)
         VALUES (?, ?, 'Asia/Singapore', 0, '21:00', NULL, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET chat_id = excluded.chat_id
         """,
         (telegram_id, chat_id, datetime.now().isoformat(timespec="seconds")),
     )
 
-    # always keep chat_id updated
     cur.execute(
-        "UPDATE users SET chat_id = ? WHERE telegram_id = ?",
-        (chat_id, telegram_id),
+        """
+        SELECT id, telegram_id, chat_id, timezone, daily_enabled, daily_time, last_sent_date
+        FROM users
+        WHERE telegram_id = ?
+        """,
+        (telegram_id,),
     )
-
-    # fetch row
-    cur.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
+
     conn.commit()
     conn.close()
 
-    # return a dict with the same keys you used before
     return {
         "db_user_id": row["id"],
         "telegram_id": row["telegram_id"],
@@ -47,75 +58,41 @@ def get_user_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict:
         "daily_time": row["daily_time"],
         "last_sent_date": row["last_sent_date"],
     }
+
+
 def set_daily_enabled(telegram_id: str, enabled: bool) -> None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET daily_enabled = ? WHERE telegram_id = ?",
-        (1 if enabled else 0, telegram_id),
-    )
-    conn.commit()
-    conn.close()
+    _update_user_field(telegram_id, "daily_enabled", 1 if enabled else 0)
 
 
 def set_daily_time(telegram_id: str, daily_time: str) -> None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET daily_time = ? WHERE telegram_id = ?",
-        (daily_time, telegram_id),
-    )
-    conn.commit()
-    conn.close()
+    _update_user_field(telegram_id, "daily_time", daily_time)
 
 
 def set_timezone(telegram_id: str, timezone: str) -> None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET timezone = ? WHERE telegram_id = ?",
-        (timezone, telegram_id),
-    )
-    conn.commit()
-    conn.close()
+    _update_user_field(telegram_id, "timezone", timezone)
 
 
 def set_last_sent_date(telegram_id: str, last_sent_date: str) -> None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET last_sent_date = ? WHERE telegram_id = ?",
-        (last_sent_date, telegram_id),
-    )
-    conn.commit()
-    conn.close()
-
-from datetime import datetime, date
-
-
-def _get_db_user_id(telegram_id: str) -> int:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        raise ValueError("User not found in DB. Call get_user_store() on /start first.")
-    return int(row["id"])
+    _update_user_field(telegram_id, "last_sent_date", last_sent_date)
 
 
 def add_transaction(telegram_id: str, tx_type: str, amount: float, note: str, ts: str) -> None:
-    user_id = _get_db_user_id(telegram_id)
-
     conn = connect()
     cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO transactions (user_id, type, amount, note, ts)
-        VALUES (?, ?, ?, ?, ?)
+        SELECT id, ?, ?, ?, ?
+        FROM users
+        WHERE telegram_id = ?
         """,
-        (user_id, tx_type, float(amount), note, ts),
+        (tx_type, float(amount), note, ts, telegram_id),
     )
+
+    if cur.rowcount == 0:
+        conn.close()
+        raise ValueError("User not found in DB. Call get_user_store() on /start first.")
+
     conn.commit()
     conn.close()
 
@@ -125,20 +102,19 @@ def get_transactions_between(telegram_id: str, start_iso: str, end_iso: str) -> 
     Returns transactions where ts is between [start_iso, end_iso).
     ISO format strings, e.g. '2026-03-04T00:00:00'
     """
-    user_id = _get_db_user_id(telegram_id)
-
     conn = connect()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT type, amount, note, ts
-        FROM transactions
-        WHERE user_id = ?
-          AND ts >= ?
-          AND ts < ?
-        ORDER BY ts ASC
+        SELECT t.type, t.amount, t.note, t.ts
+        FROM transactions t
+        JOIN users u ON u.id = t.user_id
+        WHERE u.telegram_id = ?
+          AND t.ts >= ?
+          AND t.ts < ?
+        ORDER BY t.ts ASC
         """,
-        (user_id, start_iso, end_iso),
+        (telegram_id, start_iso, end_iso),
     )
     rows = cur.fetchall()
     conn.close()
@@ -147,6 +123,7 @@ def get_transactions_between(telegram_id: str, start_iso: str, end_iso: str) -> 
         {"type": r["type"], "amount": r["amount"], "note": r["note"] or "", "ts": r["ts"]}
         for r in rows
     ]
+
 
 def get_all_users() -> list[dict]:
     conn = connect()
@@ -159,6 +136,7 @@ def get_all_users() -> list[dict]:
     )
     rows = cur.fetchall()
     conn.close()
+
     return [
         {
             "telegram_id": r["telegram_id"],

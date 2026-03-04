@@ -3,8 +3,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 def main_menu_markup():
     keyboard = [
-        [InlineKeyboardButton("➕ Expense", callback_data="EXPENSE")],
-        [InlineKeyboardButton("➕ Income", callback_data="INCOME")],
+        [InlineKeyboardButton("📉 Expense", callback_data="EXPENSE")],
+        [InlineKeyboardButton("📈 Income", callback_data="INCOME")],
         [InlineKeyboardButton("📊 Summary", callback_data="SUMMARY")],
         [InlineKeyboardButton("⏰ Schedule", callback_data="SCHEDULE")],
     ]
@@ -13,7 +13,7 @@ def main_menu_markup():
 
 async def render_menu(query):
     await query.edit_message_text(
-        "Main Menu:",
+        text="Choose an option:",
         reply_markup=main_menu_markup(),
     )
 

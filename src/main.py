@@ -1,4 +1,5 @@
 import os
+import logging
 from dotenv import load_dotenv
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -7,9 +8,11 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
+from db import init_db
 from handlers import start, menu, summary, on_menu_click, on_text
 from scheduler import send_nightly_summary
 
@@ -17,9 +20,18 @@ load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 scheduler = AsyncIOScheduler()
+logger = logging.getLogger(__name__)
+
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception while processing update", exc_info=context.error)
 
 
 def main():
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+
+    init_db()
     app = ApplicationBuilder().token(TOKEN).build()
 
     # Commands
@@ -30,6 +42,7 @@ def main():
     # Buttons + free text
     app.add_handler(CallbackQueryHandler(on_menu_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(error_handler)
 
     # Nightly checker: runs every minute, sends only when time matches
     scheduler.add_job(
