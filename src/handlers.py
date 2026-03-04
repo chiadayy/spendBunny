@@ -1,9 +1,17 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from storage import get_user_store
+from storage import (
+    get_user_store,
+    set_daily_enabled,
+    set_daily_time,
+    set_timezone,
+    add_transaction,
+    get_transactions_between,
+)
+
 from ui import main_menu_markup, render_menu, render_schedule
 
 
@@ -14,9 +22,32 @@ def parse_amount(text: str):
         return None
 
 
+def iso_start_of_day(d):
+    return datetime.combine(d, datetime.min.time()).isoformat(timespec="seconds")
+
+
+def iso_start_of_next_day(d):
+    return datetime.combine(d + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds")
+
+
+def sum_txns(txns: list[dict]):
+    income = expense = 0.0
+    count = 0
+    for tx in txns:
+        amt = float(tx["amount"])
+        if tx["type"] == "income":
+            income += amt
+        else:
+            expense += amt
+        count += 1
+    return income, expense, count
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_user_store(update, context)
-    await update.message.reply_text("Welcome to your Personal Finance Bot 💰\n\nUse /menu to begin.")
+    await update.message.reply_text(
+        "Welcome to your Personal Finance Bot 💰\n\nUse /menu to begin."
+    )
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -24,36 +55,25 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store = get_user_store(update, context)
-    txns = store.get("txns", [])
-
+    # Command version: Today summary from DB
+    telegram_id = str(update.effective_user.id)
     today = datetime.now().date()
-    income = expense = 0.0
-    count = 0
 
-    for tx in txns:
-        ts = tx.get("ts")
-        if not ts:
-            continue
-        tx_date = datetime.fromisoformat(ts).date()
-        if tx_date != today:
-            continue
+    txns = get_transactions_between(
+        telegram_id,
+        iso_start_of_day(today),
+        iso_start_of_next_day(today),
+    )
 
-        amt = float(tx["amount"])
-        if tx["type"] == "income":
-            income += amt
-        else:
-            expense += amt
-        count += 1
-
-    net = income - expense
+    inc, exp, cnt = sum_txns(txns)
+    net = inc - exp
 
     await update.message.reply_text(
         f"📊 Summary — Today\n"
-        f"Income: +${income:.2f}\n"
-        f"Spent: -${expense:.2f}\n"
+        f"Income: +${inc:.2f}\n"
+        f"Spent: -${exp:.2f}\n"
         f"Net: ${net:.2f}\n"
-        f"Transactions: {count}\n\n"
+        f"Transactions: {cnt}\n\n"
         f"Type /menu to continue."
     )
 
@@ -63,17 +83,25 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     choice = query.data
 
-    # Skip note
+    # -------------------------
+    # Skip note -> save txn to DB
+    # -------------------------
     if choice == "SKIP_NOTE":
-        store = get_user_store(update, context)
-
         tx = {
             "type": context.user_data.get("pending_type"),
             "amount": context.user_data.get("pending_amount"),
             "note": "",
             "ts": datetime.now().isoformat(timespec="seconds"),
         }
-        store["txns"].append(tx)
+
+        telegram_id = str(update.effective_user.id)
+        add_transaction(
+            telegram_id=telegram_id,
+            tx_type=tx["type"],
+            amount=tx["amount"],
+            note="",
+            ts=tx["ts"],
+        )
 
         context.user_data.pop("pending_type", None)
         context.user_data.pop("pending_amount", None)
@@ -85,7 +113,9 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # -------------------------
     # Main menu options
+    # -------------------------
     if choice == "EXPENSE":
         context.user_data["state"] = "AWAIT_EXPENSE_AMOUNT"
         await query.edit_message_text("➕ Expense: send the amount (e.g. 6.50)")
@@ -105,20 +135,32 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text(
             "📊 Choose a period:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
+    # -------------------------
+    # Schedule screen
+    # -------------------------
     if choice == "SCHEDULE":
         store = get_user_store(update, context)
         status = "ON ✅" if store.get("daily_enabled") else "OFF ❌"
-        await render_schedule(query, status, store.get("daily_time", "21:00"), store.get("timezone", "Asia/Singapore"))
+        await render_schedule(
+            query,
+            status,
+            store.get("daily_time", "21:00"),
+            store.get("timezone", "Asia/Singapore"),
+        )
         return
 
-    # Schedule actions
+    # -------------------------
+    # Schedule actions (persist to SQLite)
+    # -------------------------
     if choice == "SCH_ON":
+        telegram_id = str(update.effective_user.id)
+        set_daily_enabled(telegram_id, True)
+
         store = get_user_store(update, context)
-        store["daily_enabled"] = True
         status = "ON ✅" if store.get("daily_enabled") else "OFF ❌"
         await render_schedule(
             query,
@@ -129,8 +171,10 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if choice == "SCH_OFF":
+        telegram_id = str(update.effective_user.id)
+        set_daily_enabled(telegram_id, False)
+
         store = get_user_store(update, context)
-        store["daily_enabled"] = False
         status = "ON ✅" if store.get("daily_enabled") else "OFF ❌"
         await render_schedule(
             query,
@@ -162,19 +206,36 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if choice.startswith("SET_TIME_"):
-        store = get_user_store(update, context)
         parts = choice.replace("SET_TIME_", "").split("_")
         hh, mm = parts[0], parts[1]
-        store["daily_time"] = f"{hh}:{mm}"
+        new_time = f"{hh}:{mm}"
 
-        await query.edit_message_text(f"✅ Nightly time set to {hh}:{mm}")
+        telegram_id = str(update.effective_user.id)
+        set_daily_time(telegram_id, new_time)
+
+        await query.edit_message_text(f"✅ Nightly time set to {new_time}")
         await asyncio.sleep(1)
         await render_menu(query)
         return
 
-    if choice == "SET_TZ_ASIA_SINGAPORE":
+    if choice == "SCH_TZ":
         store = get_user_store(update, context)
-        store["timezone"] = "Asia/Singapore"
+        current = store.get("timezone", "Asia/Singapore")
+        keyboard = [
+            [InlineKeyboardButton("Singapore (Asia/Singapore)", callback_data="SET_TZ_ASIA_SINGAPORE")],
+            [InlineKeyboardButton("Back", callback_data="SCHEDULE")],
+        ]
+        await query.edit_message_text(
+            f"🌍 Set timezone (current: {current})",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if choice == "SET_TZ_ASIA_SINGAPORE":
+        telegram_id = str(update.effective_user.id)
+        set_timezone(telegram_id, "Asia/Singapore")
+
+        store = get_user_store(update, context)
         status = "ON ✅" if store.get("daily_enabled") else "OFF ❌"
         await render_schedule(
             query,
@@ -184,37 +245,22 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if choice == "SET_TZ_ASIA_SINGAPORE":
-        store = get_user_store(update, context)
-        store["timezone"] = "Asia/Singapore"
-        await render_schedule(query, update, context)
-        return
-
-    # Summary period computations
-    def _sum_for_range(txns, start_date, end_date):
-        income = expense = 0.0
-        count = 0
-        for tx in txns:
-            ts = tx.get("ts")
-            if not ts:
-                continue
-            d = datetime.fromisoformat(ts).date()
-            if not (start_date <= d <= end_date):
-                continue
-            amt = float(tx["amount"])
-            if tx["type"] == "income":
-                income += amt
-            else:
-                expense += amt
-            count += 1
-        return income, expense, count
-
+    # -------------------------
+    # Summary buttons (DB-backed)
+    # -------------------------
     if choice == "SUM_TODAY":
-        store = get_user_store(update, context)
-        txns = store.get("txns", [])
+        telegram_id = str(update.effective_user.id)
         today = datetime.now().date()
-        inc, exp, cnt = _sum_for_range(txns, today, today)
+
+        txns = get_transactions_between(
+            telegram_id,
+            iso_start_of_day(today),
+            iso_start_of_next_day(today),
+        )
+
+        inc, exp, cnt = sum_txns(txns)
         net = inc - exp
+
         await query.edit_message_text(
             f"📊 Summary — Today\n"
             f"Income: +${inc:.2f}\n"
@@ -226,13 +272,20 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if choice == "SUM_WEEK":
-        store = get_user_store(update, context)
-        txns = store.get("txns", [])
+        telegram_id = str(update.effective_user.id)
         today = datetime.now().date()
-        start = today.fromordinal(today.toordinal() - today.weekday())  # Monday
-        end = today
-        inc, exp, cnt = _sum_for_range(txns, start, end)
+        start = today - timedelta(days=today.weekday())  # Monday
+        end = today  # inclusive display; we query up to tomorrow exclusive
+
+        txns = get_transactions_between(
+            telegram_id,
+            iso_start_of_day(start),
+            iso_start_of_next_day(end),
+        )
+
+        inc, exp, cnt = sum_txns(txns)
         net = inc - exp
+
         await query.edit_message_text(
             f"📊 Summary — This Week\n"
             f"({start} to {end})\n"
@@ -245,13 +298,20 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if choice == "SUM_MONTH":
-        store = get_user_store(update, context)
-        txns = store.get("txns", [])
+        telegram_id = str(update.effective_user.id)
         today = datetime.now().date()
         start = today.replace(day=1)
         end = today
-        inc, exp, cnt = _sum_for_range(txns, start, end)
+
+        txns = get_transactions_between(
+            telegram_id,
+            iso_start_of_day(start),
+            iso_start_of_next_day(end),
+        )
+
+        inc, exp, cnt = sum_txns(txns)
         net = inc - exp
+
         await query.edit_message_text(
             f"📊 Summary — This Month\n"
             f"({start} to {end})\n"
@@ -275,7 +335,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (update.message.text or "").strip()
 
-    # Custom time input
+    # -------------------------
+    # Custom time input (persist to SQLite)
+    # -------------------------
     if state == "AWAIT_CUSTOM_TIME":
         t = text.strip()
         try:
@@ -285,21 +347,30 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not (0 <= hh <= 23 and 0 <= mm <= 59):
                 raise ValueError
         except Exception:
-            await update.message.reply_text("Invalid time. Send HH:MM in 24h format (e.g. 21:35).")
+            await update.message.reply_text(
+                "Invalid time. Send HH:MM in 24h format (e.g. 21:35)."
+            )
             return
 
-        store = get_user_store(update, context)
-        store["daily_time"] = f"{hh:02d}:{mm:02d}"
-        context.user_data["state"] = None
+        new_time = f"{hh:02d}:{mm:02d}"
+        telegram_id = str(update.effective_user.id)
+        set_daily_time(telegram_id, new_time)
 
-        await update.message.reply_text(f"✅ Nightly time set to {hh:02d}:{mm:02d}\nType /menu to continue.")
+        context.user_data["state"] = None
+        await update.message.reply_text(
+            f"✅ Nightly time set to {new_time}\nType /menu to continue."
+        )
         return
 
+    # -------------------------
     # Expense amount
+    # -------------------------
     if state == "AWAIT_EXPENSE_AMOUNT":
         amt = parse_amount(text)
         if amt is None or amt <= 0:
-            await update.message.reply_text("Please send a valid positive number (e.g. 6.50).")
+            await update.message.reply_text(
+                "Please send a valid positive number (e.g. 6.50)."
+            )
             return
 
         context.user_data["pending_amount"] = amt
@@ -309,15 +380,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("Skip", callback_data="SKIP_NOTE")]]
         await update.message.reply_text(
             "Add a note (optional), or tap Skip.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
+    # -------------------------
     # Income amount
+    # -------------------------
     if state == "AWAIT_INCOME_AMOUNT":
         amt = parse_amount(text)
         if amt is None or amt <= 0:
-            await update.message.reply_text("Please send a valid positive number (e.g. 120).")
+            await update.message.reply_text(
+                "Please send a valid positive number (e.g. 120)."
+            )
             return
 
         context.user_data["pending_amount"] = amt
@@ -327,21 +402,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("Skip", callback_data="SKIP_NOTE")]]
         await update.message.reply_text(
             "Add a note (optional), or tap Skip.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
 
-    # Note step -> save transaction
+    # -------------------------
+    # Note step -> save transaction to DB
+    # -------------------------
     if state == "AWAIT_NOTE":
-        store = get_user_store(update, context)
-
         tx = {
             "type": context.user_data.get("pending_type"),
             "amount": context.user_data.get("pending_amount"),
             "note": text,
             "ts": datetime.now().isoformat(timespec="seconds"),
         }
-        store["txns"].append(tx)
+
+        telegram_id = str(update.effective_user.id)
+        add_transaction(
+            telegram_id=telegram_id,
+            tx_type=tx["type"],
+            amount=tx["amount"],
+            note=tx["note"],
+            ts=tx["ts"],
+        )
 
         context.user_data.pop("pending_type", None)
         context.user_data.pop("pending_amount", None)
@@ -353,3 +436,4 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Note: {tx['note']}\n\n"
             "Type /menu to continue."
         )
+        return
